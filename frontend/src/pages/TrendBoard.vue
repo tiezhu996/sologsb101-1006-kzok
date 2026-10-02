@@ -16,7 +16,7 @@ import { useSectionStore } from '@/stores/sectionStore'
 import { useSurveyStore } from '@/stores/surveyStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useCrackTrend } from '@/hooks/useCrackTrend'
-import { db, type AdviceRow } from '@/utils/db'
+import { db, deleteAdviceTombstoned, type AdviceRow } from '@/utils/db'
 import {
   ADVICE_LEVELS,
   ADVICE_MEASURES,
@@ -158,8 +158,8 @@ async function removeAdvice(row: CrackEnriched): Promise<void> {
     { type: 'warning', confirmButtonText: '确认撤销', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!confirmed) return
-  await db.advices.delete(advice.id)
-  ElMessage.success('整治建议已撤销')
+  await deleteAdviceTombstoned(advice.id)
+  ElMessage.success('整治建议已撤销（删除已记录，可随备份合并）')
 }
 
 function openDrawer(row: CrackEnriched): void {

@@ -312,6 +312,12 @@ function selectCrack(crackId: string): void {
               </template>
             </el-table-column>
             <el-table-column prop="surveyor" label="复测人" width="100" />
+            <el-table-column label="来源" width="120">
+              <template #default="{ row }">
+                <el-tag v-if="row.mergeTag" size="small" type="warning" effect="plain">{{ row.mergeTag }}</el-tag>
+                <span v-else class="muted">本机</span>
+              </template>
+            </el-table-column>
             <el-table-column label="操作" width="140">
               <template #default="{ row }">
                 <el-button size="small" text type="primary" @click="openEdit(row.id)">

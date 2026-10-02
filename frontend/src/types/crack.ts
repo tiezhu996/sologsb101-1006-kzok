@@ -17,6 +17,8 @@ export interface Crack {
   /** 初测长度（mm） */
   lengthMm: number
   state: CrackState
+  /** 合并并列保留时打的来源标记，如「对侧复测·2024-06-20」；核验人处理后可清 */
+  mergeTag?: string
   createdAt: number
   updatedAt: number
 }

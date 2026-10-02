@@ -12,6 +12,8 @@ export interface Survey {
   deltaWidthMm: number
   /** 复测人 */
   surveyor: string
+  /** 合并并列保留时打的来源标记；核验人处理后可清 */
+  mergeTag?: string
   createdAt: number
   updatedAt: number
 }

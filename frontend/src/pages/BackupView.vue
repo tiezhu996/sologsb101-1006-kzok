@@ -1,12 +1,22 @@
 <script setup lang="ts">
 /**
  * /backup 整治建议与结构版本导出
- * 维护建议措施与状态流转，导入导出全量 JSON，重置演示数据。
+ * 维护建议措施与状态流转，导出/覆盖导入全量 JSON，两班离线三向合并，重置演示数据。
  * 消费全部模型；复用 <EmptyPanel>、<LevelTag>、<FilterBar>、<StatBadge>。
  */
 import { computed, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Delete, Download, Edit, Plus, Refresh, RefreshRight, Right, Upload } from '@element-plus/icons-vue'
+import {
+  Connection,
+  Delete,
+  Download,
+  Edit,
+  Plus,
+  Refresh,
+  RefreshRight,
+  Right,
+  Upload
+} from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import LevelTag from '@/components/common/LevelTag.vue'
@@ -14,6 +24,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useCrackStore } from '@/stores/crackStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useMergeStore } from '@/stores/mergeStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   DB_VERSION,
@@ -40,12 +51,16 @@ import {
 } from '@/types/advice'
 import { exportCrackCsv } from '@/utils/export'
 import { formatMm } from '@/utils/rate'
+import { entityLabel, fieldLabel } from '@/utils/merge'
+import type { MergeConflict, ResolutionKind } from '@/types/merge'
+import { MERGE_TABLE_LABEL } from '@/types/tombstone'
 
 type FilterModel = { keyword: string; [key: string]: string | string[] | boolean }
 
 const crackStore = useCrackStore()
 const surveyStore = useSurveyStore()
 const sectionStore = useSectionStore()
+const mergeStore = useMergeStore()
 const adviceTable = useIdbTable<AdviceRow>((database) => database.advices, { sortByUpdatedAt: false })
 
 const counts = ref<Record<string, number>>({})
@@ -193,6 +208,7 @@ async function advance(advice: AdviceRow): Promise<void> {
 /* ---------------------------- 备份与恢复 ---------------------------- */
 
 const fileInput = ref<HTMLInputElement | null>(null)
+const mergeFileInput = ref<HTMLInputElement | null>(null)
 
 async function exportAll(): Promise<void> {
   const payload = await exportSnapshot()
@@ -228,13 +244,13 @@ async function onFileChange(event: Event): Promise<void> {
       return
     }
     const confirmed = await ElMessageBox.confirm(
-      '导入将覆盖当前全部本地数据，确认继续？',
-      '导入确认',
+      '覆盖导入会用该存档整体替换当前全部本地数据（不会并入未提交的合并暂存）。如只想并入对侧复测，请改用「离线合并」。确认覆盖？',
+      '覆盖导入确认',
       { type: 'warning', confirmButtonText: '覆盖导入', cancelButtonText: '取消' }
     ).catch(() => false)
     if (!confirmed) return
     await importSnapshot(payload)
-    ElMessage.success('存档已导入')
+    ElMessage.success('存档已整库覆盖导入')
     await refreshCounts()
   } catch (error) {
     ElMessage.error(`导入失败：${error instanceof Error ? error.message : '未知错误'}`)
@@ -242,6 +258,175 @@ async function onFileChange(event: Event): Promise<void> {
     target.value = ''
   }
 }
+
+/* ---------------------------- 离线三向合并 ---------------------------- */
+
+function triggerMergeFile(): void {
+  mergeFileInput.value?.click()
+}
+
+async function onMergeFileChange(event: Event): Promise<void> {
+  const target = event.target as HTMLInputElement
+  const file = target.files?.[0]
+  if (!file) return
+  try {
+    const text = await file.text()
+    const result = await mergeStore.ingest(JSON.parse(text), file.name)
+    if (result.status === 'already-merged') {
+      ElMessage.warning(result.message)
+    } else if (result.status === 'resumed') {
+      ElMessage.info(result.message)
+    } else {
+      ElMessage.success(result.message)
+    }
+  } catch (error) {
+    ElMessage.error(`合并文件读入失败：${error instanceof Error ? error.message : '未知错误'}`)
+  } finally {
+    target.value = ''
+  }
+}
+
+const activeMerge = computed(() => mergeStore.activeStaging)
+const pendingMergeCount = computed(() => mergeStore.pendingCount)
+
+function conflictTableLabel(conflict: MergeConflict): string {
+  return MERGE_TABLE_LABEL[conflict.table]
+}
+
+function conflictName(conflict: MergeConflict): string {
+  const row = conflict.remote ?? conflict.local ?? conflict.base
+  return entityLabel(conflict.table, row)
+}
+
+function conflictKindText(conflict: MergeConflict): string {
+  switch (conflict.kind) {
+    case 'both-edited':
+      return '两边都改过'
+    case 'delete-edit':
+      return conflict.deleteSide === 'local' ? '本机已删除 · 对侧改过' : '对侧已删除 · 本机改过'
+    case 'both-deleted':
+      return '两边都已删除'
+    case 'legacy-add':
+      return '双方新增撞号'
+  }
+}
+
+function resolutionText(resolution: ResolutionKind | null): string {
+  switch (resolution) {
+    case 'parallel':
+      return '并列保留'
+    case 'local':
+      return '保留本机'
+    case 'remote':
+      return '接回对侧'
+    case 'delete':
+      return '按删除处理'
+    case 'drop':
+      return '放弃对侧'
+    default:
+      return '待核验'
+  }
+}
+
+function resolutionTagType(resolution: ResolutionKind | null): 'info' | 'warning' | 'success' | 'primary' | 'danger' {
+  if (resolution === null) return 'danger'
+  if (resolution === 'parallel') return 'success'
+  if (resolution === 'delete') return 'warning'
+  return 'primary'
+}
+
+/** 某条冲突可选的处理动作 */
+function conflictOptions(conflict: MergeConflict): Array<{ value: ResolutionKind; label: string; disabled?: boolean }> {
+  const options: Array<{ value: ResolutionKind; label: string; disabled?: boolean }> = []
+  if (conflict.parallelable) options.push({ value: 'parallel', label: '并列保留（复制对侧为新记录）' })
+  if (conflict.remote) options.push({ value: 'remote', label: '接回对侧版本' })
+  if (conflict.local) options.push({ value: 'local', label: '保留本机版本' })
+  if (conflict.kind === 'delete-edit') {
+    options.push({ value: 'delete', label: '按删除处理' })
+  }
+  options.push({ value: 'drop', label: '放弃对侧该条' })
+  return options
+}
+
+async function chooseResolution(conflict: MergeConflict, resolution: ResolutionKind): Promise<void> {
+  await mergeStore.resolveConflict(conflict.key, resolution)
+}
+
+async function parallelAll(): Promise<void> {
+  const count = await mergeStore.resolveAllParallel()
+  if (count === 0) {
+    ElMessage.info('没有可并列保留的未决冲突')
+    return
+  }
+  ElMessage.success(`已将 ${count} 处裂缝/环片/测次冲突设为并列保留`)
+}
+
+async function commitMerge(): Promise<void> {
+  if (!activeMerge.value) return
+  if (pendingMergeCount.value > 0) {
+    ElMessage.warning(`还有 ${pendingMergeCount.value} 处冲突未核验，处理完再一起入库`)
+    return
+  }
+  const confirmed = await ElMessageBox.confirm(
+    '核验已完成，确认把本次合并结果一次性入库？入库后测次将按日期重排，变化量、预警等级与建议依据会自动重算。',
+    '合并入库确认',
+    { type: 'warning', confirmButtonText: '确认入库', cancelButtonText: '再看看' }
+  ).catch(() => false)
+  if (!confirmed) return
+  try {
+    const result = await mergeStore.commit()
+    ElMessage.success(`合并已入库，重算了 ${result.changedCracks} 条裂缝的测次与分级`)
+    await refreshCounts()
+    await ElMessageBox.alert(
+      '建议立即「导出全量 JSON」生成带新基线的台账，分发给另一班组作为下次复测的共同基线，避免下次合并出现多余冲突。',
+      '合并完成',
+      { confirmButtonText: '知道了' }
+    ).catch(() => undefined)
+  } catch (error) {
+    ElMessage.error(`合并入库失败：${error instanceof Error ? error.message : '未知错误'}`)
+  }
+}
+
+async function discardMerge(): Promise<void> {
+  if (!activeMerge.value) return
+  const confirmed = await ElMessageBox.confirm('放弃该合并暂存？暂存内的核验结果将被清除，本机业务数据不受影响。', '放弃暂存', {
+    type: 'warning',
+    confirmButtonText: '放弃暂存',
+    cancelButtonText: '取消'
+  }).catch(() => false)
+  if (!confirmed) return
+  await mergeStore.discardStaging(activeMerge.value.id)
+  ElMessage.success('合并暂存已放弃')
+}
+
+function resumeMerge(id: string): void {
+  mergeStore.openStaging(id)
+}
+
+function formatValue(value: unknown): string {
+  if (value === undefined || value === null || value === '') return '—'
+  return String(value)
+}
+
+function changeFieldLabel(field: string): string {
+  return fieldLabel(field)
+}
+
+function autoActionText(action: 'add' | 'update' | 'delete'): string {
+  return action === 'add' ? '新增接回' : action === 'update' ? '改动接回' : '删除接回'
+}
+
+function autoActionType(action: 'add' | 'update' | 'delete'): 'success' | 'primary' | 'warning' {
+  return action === 'add' ? 'success' : action === 'update' ? 'primary' : 'warning'
+}
+
+const activeMergeSummary = computed(() =>
+  activeMerge.value ? mergeStore.summaryOf(activeMerge.value) : { autoAdd: 0, autoUpdate: 0, autoDelete: 0 }
+)
+
+const otherStagings = computed(() =>
+  mergeStore.pendingStagings.filter((item) => item.id !== mergeStore.activeId)
+)
 
 async function clearData(): Promise<void> {
   const confirmed = await ElMessageBox.confirm('清空后所有本地数据将被删除且不可恢复，确认清空？', '清空确认', {
@@ -389,6 +574,184 @@ function adviceRowKey(row: AdviceRow): string {
       </el-table>
     </div>
 
+    <div class="panel" style="margin-top: 16px">
+      <div class="panel-head">
+        <h3 class="panel-title">两班离线合并</h3>
+        <span class="muted">先从同一版台账各自导出基线，分头复测后在此并入对侧备份</span>
+      </div>
+
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="合并规则：仅一侧改过的记录自动接回；裂缝、环片、测次两边都改过默认并列保留；区间与建议的冲突、以及删除与修改相撞，需核验人逐条处理，全部处理完才能入库。"
+        style="margin-bottom: 12px"
+      />
+
+      <div style="display: flex; flex-wrap: wrap; gap: 8px">
+        <el-button type="primary" :icon="Connection" @click="triggerMergeFile">读入对侧备份并合并</el-button>
+        <span v-if="mergeStore.pendingStagings.length > 0" class="muted" style="align-self: center">
+          有 {{ mergeStore.pendingStagings.length }} 个未入库的合并暂存（中断后现场已保留）
+        </span>
+      </div>
+      <input
+        ref="mergeFileInput"
+        type="file"
+        accept="application/json,.json"
+        style="display: none"
+        @change="onMergeFileChange"
+      />
+
+      <!-- 其他未提交暂存（恢复现场） -->
+      <div v-if="otherStagings.length > 0" style="margin-top: 12px">
+        <h4 class="panel-subtitle">未入库的合并暂存</h4>
+        <el-table :data="otherStagings" border stripe size="small">
+          <el-table-column label="备份文件" min-width="220">
+            <template #default="{ row }">
+              <strong>{{ row.fileName }}</strong>
+              <div class="muted">导出于 {{ row.remoteExportedAt.slice(0, 19).replace('T', ' ') }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="方式" width="120">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.mode === 'three-way' ? 'primary' : 'warning'">
+                {{ row.mode === 'three-way' ? '三向合并' : '旧版保守合并' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="自动变化" width="160">
+            <template #default="{ row }">
+              增 {{ mergeStore.summaryOf(row).autoAdd }} · 改 {{ mergeStore.summaryOf(row).autoUpdate }} · 删
+              {{ mergeStore.summaryOf(row).autoDelete }}
+            </template>
+          </el-table-column>
+          <el-table-column label="待核验冲突" width="110">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.conflicts.filter((c: MergeConflict) => c.resolution === null).length > 0 ? 'danger' : 'success'">
+                {{ row.conflicts.filter((c: MergeConflict) => c.resolution === null).length }} / {{ row.conflicts.length }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="120">
+            <template #default="{ row }">
+              <el-button size="small" text type="primary" @click="resumeMerge(row.id)">恢复核验</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+
+      <!-- 当前合并暂存：核验现场 -->
+      <template v-if="activeMerge">
+        <el-divider />
+        <div class="panel-head">
+          <h3 class="panel-title" style="margin: 0">
+            合并核验 · {{ activeMerge.fileName }}
+            <el-tag
+              size="small"
+              :type="activeMerge.mode === 'three-way' ? 'primary' : 'warning'"
+              style="margin-left: 8px"
+            >
+              {{ activeMerge.mode === 'three-way' ? '三向（已对上基线）' : '旧版备份（无基线，保守合并）' }}
+            </el-tag>
+          </h3>
+          <div style="display: flex; gap: 8px">
+            <el-button size="small" :icon="Connection" @click="parallelAll">可并列项一键并列</el-button>
+            <el-button size="small" type="danger" plain :icon="Delete" @click="discardMerge">放弃暂存</el-button>
+          </div>
+        </div>
+
+        <div class="stat-row">
+          <StatBadge label="自动新增" :value="activeMergeSummary.autoAdd" suffix="条" icon="Plus" tone="success" />
+          <StatBadge label="自动改动接回" :value="activeMergeSummary.autoUpdate" suffix="条" icon="Edit" tone="info" />
+          <StatBadge label="自动删除接回" :value="activeMergeSummary.autoDelete" suffix="条" icon="Delete" tone="warning" />
+          <StatBadge label="待核验冲突" :value="pendingMergeCount" suffix="处" icon="WarningFilled" tone="danger" />
+        </div>
+
+        <!-- 自动接回清单 -->
+        <el-collapse style="margin-top: 8px">
+          <el-collapse-item name="auto">
+            <template #title>
+              <span>自动接回变化（{{ activeMerge.autoChanges.length }}）</span>
+            </template>
+            <el-table :data="activeMerge.autoChanges" border stripe size="small">
+              <el-table-column label="类型" width="110">
+                <template #default="{ row }">
+                  <el-tag size="small" :type="autoActionType(row.action)">{{ autoActionText(row.action) }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="表" width="100">
+                <template #default="{ row }">{{ MERGE_TABLE_LABEL[row.table as keyof typeof MERGE_TABLE_LABEL] }}</template>
+              </el-table-column>
+              <el-table-column label="记录" min-width="200">
+                <template #default="{ row }">{{ row.label }}</template>
+              </el-table-column>
+            </el-table>
+          </el-collapse-item>
+        </el-collapse>
+
+        <!-- 冲突核验 -->
+        <h4 class="panel-subtitle">冲突核验（{{ activeMerge.conflicts.length }}）</h4>
+        <EmptyPanel
+          v-if="activeMerge.conflicts.length === 0"
+          title="没有冲突"
+          description="两侧改动互不相交，全部变化都会自动接回，可直接入库。"
+          compact
+        />
+        <el-table v-else :data="activeMerge.conflicts" border stripe size="small" row-key="key">
+          <el-table-column label="对象" min-width="180">
+            <template #default="{ row }">
+              <strong>{{ conflictName(row) }}</strong>
+              <div class="muted">{{ conflictTableLabel(row) }} · {{ conflictKindText(row) }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="字段差异" min-width="260">
+            <template #default="{ row }">
+              <div v-if="row.changes.length === 0" class="muted">
+                {{ row.kind === 'delete-edit' ? '删除与修改相撞' : '无字段级差异' }}
+              </div>
+              <div v-for="change in row.changes" :key="change.field" class="merge-diff">
+                <span class="merge-diff__field">{{ changeFieldLabel(change.field) }}</span>
+                <span class="merge-diff__local" :title="`本机：${formatValue(change.local)}`">本机 {{ formatValue(change.local) }}</span>
+                <span class="merge-diff__arrow">→</span>
+                <span class="merge-diff__remote" :title="`对侧：${formatValue(change.remote)}`">对侧 {{ formatValue(change.remote) }}</span>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="核验处理" width="300">
+            <template #default="{ row }">
+              <el-radio-group
+                :model-value="row.resolution"
+                size="small"
+                @update:model-value="(value: ResolutionKind) => chooseResolution(row, value)"
+              >
+                <el-radio-button
+                  v-for="option in conflictOptions(row)"
+                  :key="option.value"
+                  :value="option.value"
+                >
+                  {{ option.label }}
+                </el-radio-button>
+              </el-radio-group>
+              <div style="margin-top: 4px">
+                <el-tag size="small" :type="resolutionTagType(row.resolution)">{{ resolutionText(row.resolution) }}</el-tag>
+                <span v-if="row.resolution === 'parallel'" class="muted" style="margin-left: 6px">
+                  对侧将复制为新 id 并列，级联测次/建议一并复制
+                </span>
+              </div>
+            </template>
+          </el-table-column>
+        </el-table>
+
+        <div style="margin-top: 14px; display: flex; align-items: center; gap: 12px">
+          <el-button type="primary" :disabled="!mergeStore.canCommit" :loading="mergeStore.loading" @click="commitMerge">
+            核验完成，一起入库
+          </el-button>
+          <span v-if="pendingMergeCount > 0" class="muted">还有 {{ pendingMergeCount }} 处冲突未处理，暂不能入库</span>
+          <span v-else class="muted">全部冲突已核验，可以入库</span>
+        </div>
+      </template>
+    </div>
+
     <div class="panel">
       <h3 class="panel-title">结构版本与本地数据</h3>
       <el-descriptions :column="3" border size="small">
@@ -402,11 +765,14 @@ function adviceRowKey(row: AdviceRow): string {
           {{ counts.cracks ?? 0 }} / {{ counts.surveys ?? 0 }}
         </el-descriptions-item>
         <el-descriptions-item label="整治建议">{{ counts.advices ?? 0 }}</el-descriptions-item>
+        <el-descriptions-item label="删除墓碑（待合并）">{{ counts.tombstones ?? 0 }}</el-descriptions-item>
+        <el-descriptions-item label="合并暂存">{{ mergeStore.pendingStagings.length }}</el-descriptions-item>
       </el-descriptions>
 
       <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px">
-        <el-button type="primary" :icon="Download" @click="exportAll">导出全量 JSON</el-button>
-        <el-button :icon="Upload" @click="triggerImport">导入 JSON 存档</el-button>
+        <el-button type="primary" :icon="Download" @click="exportAll">导出全量 JSON（含基线）</el-button>
+        <el-button :icon="Upload" @click="triggerImport">覆盖导入 JSON（整库替换）</el-button>
+        <el-button :icon="Connection" @click="triggerMergeFile">离线合并对侧备份</el-button>
         <el-button :icon="RefreshRight" @click="reseed">重置为演示数据</el-button>
         <el-button type="danger" plain :icon="Delete" @click="clearData">清空本地数据</el-button>
         <el-button :icon="Refresh" @click="refreshCounts">刷新统计</el-button>
@@ -455,6 +821,12 @@ function adviceRowKey(row: AdviceRow): string {
   font-weight: 600;
 }
 
+.panel-subtitle {
+  margin: 14px 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
 .panel-head {
   display: flex;
   flex-wrap: wrap;
@@ -462,5 +834,32 @@ function adviceRowKey(row: AdviceRow): string {
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+.merge-diff {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.merge-diff__field {
+  min-width: 64px;
+  font-weight: 600;
+  color: #16233a;
+}
+
+.merge-diff__local {
+  color: #5b6b82;
+}
+
+.merge-diff__remote {
+  color: #c0392b;
+}
+
+.merge-diff__arrow {
+  color: #8c99ab;
 }
 </style>

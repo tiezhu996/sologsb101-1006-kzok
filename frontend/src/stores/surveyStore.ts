@@ -5,10 +5,10 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { db, type SurveyRow } from '@/utils/db'
+import { db, deleteSurveyTombstoned, type SurveyRow } from '@/utils/db'
 import type { Survey, SurveyDraft } from '@/types/survey'
 import type { AdviceLevel } from '@/types/advice'
-import { buildSurveyPoints, levelFromRate, round } from '@/utils/rate'
+import { basisText, buildSurveyPoints, latestRate, levelFromRate, round } from '@/utils/rate'
 
 export interface CrackRateSummary {
   crackId: string
@@ -137,7 +137,7 @@ export const useSurveyStore = defineStore('survey', () => {
   async function removeSurvey(id: string): Promise<void> {
     const row = surveyTable.rows.value.find((item) => item.id === id)
     if (!row) return
-    await surveyTable.remove(id)
+    await deleteSurveyTombstoned(id)
     await recalculate(row.crackId)
   }
 
@@ -167,6 +167,36 @@ export const useSurveyStore = defineStore('survey', () => {
     await db.cracks.update(crackId, { widthMm: latest.widthMm, lengthMm: latest.lengthMm, updatedAt: Date.now() })
   }
 
+  /**
+   * 按最新测次速率重算裂缝建议的等级与判定依据（措施与流转状态保持人工结果不变）。
+   * 合并补入测次后调用，使预警等级与建议依据跟着重算。
+   */
+  async function refreshAdviceLevel(crackId: string): Promise<void> {
+    const rows = await db.surveys.where('crackId').equals(crackId).toArray()
+    const points = buildSurveyPoints(rows)
+    if (points.length < 2) return
+    const rate = latestRate(points)
+    const level: AdviceLevel = levelFromRate(rate)
+    const advice = await db.advices.where('crackId').equals(crackId).first()
+    if (advice) {
+      await db.advices.update(advice.id, { level, basis: basisText(rate, level), updatedAt: Date.now() })
+    }
+  }
+
+  /**
+   * 合并入库后的统一重算：按日期重排序次、重算变化量、同步裂缝最新读数，
+   * 并重算建议等级与判定依据。输入的受影响裂缝 id 会做并集去重。
+   */
+  async function reconcileAfterMerge(crackIds: Iterable<string>): Promise<void> {
+    const ids = Array.from(new Set(Array.from(crackIds))).filter((id) => id.length > 0)
+    for (const crackId of ids) {
+      // eslint-disable-next-line no-await-in-loop
+      await recalculate(crackId)
+      // eslint-disable-next-line no-await-in-loop
+      await refreshAdviceLevel(crackId)
+    }
+  }
+
   return {
     surveyTable,
     surveys,
@@ -181,6 +211,7 @@ export const useSurveyStore = defineStore('survey', () => {
     createSurvey,
     updateSurvey,
     removeSurvey,
-    recalculate
+    recalculate,
+    reconcileAfterMerge
   }
 })

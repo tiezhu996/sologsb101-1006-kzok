@@ -11,6 +11,8 @@ export interface Ring {
   segmentType: SegmentType
   /** 安装日期 YYYY-MM-DD */
   installDate: string
+  /** 合并并列保留时打的来源标记；核验人处理后可清 */
+  mergeTag?: string
   createdAt: number
   updatedAt: number
 }

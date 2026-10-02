@@ -290,9 +290,12 @@ function latestDateOf(crackId: string): string {
         @selection-change="onSelectionChange"
       >
         <el-table-column type="selection" width="46" />
-        <el-table-column label="裂缝编号" width="140">
+        <el-table-column label="裂缝编号" width="170">
           <template #default="{ row }">
             <strong>{{ row.crack.code }}</strong>
+            <el-tag v-if="row.crack.mergeTag" size="small" type="warning" effect="plain" style="margin-top: 2px">
+              {{ row.crack.mergeTag }}
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="区间 / 里程" min-width="180">
