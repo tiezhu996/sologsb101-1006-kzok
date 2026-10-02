@@ -36,6 +36,12 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/pages/BackupView.vue'),
     meta: { title: '整治建议与数据备份', icon: 'Coin' }
   },
+  {
+    path: '/merge',
+    name: 'merge-review',
+    component: () => import('@/pages/MergeReview.vue'),
+    meta: { title: '离线合并核验', icon: 'Connection' }
+  },
   { path: '/:pathMatch(.*)*', redirect: '/sections' }
 ]
 

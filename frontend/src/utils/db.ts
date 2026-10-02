@@ -10,12 +10,18 @@ import type { Ring } from '@/types/ring'
 import type { Crack } from '@/types/crack'
 import type { Survey } from '@/types/survey'
 import type { Advice } from '@/types/advice'
+import type { EntityTable, Tombstone } from '@/types/tombstone'
+import { round } from '@/utils/rate'
+import { entityLabel, signatureOf } from '@/utils/mergeUtil'
 
 /** IndexedDB 数据库名 */
 export const DB_NAME = 'gbtunnelcrack'
 
 /** 当前数据结构版本号：调整表结构必须递增并补 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
+
+/** 删除操作的默认留名人（未设置班组名时） */
+export const DEFAULT_ACTOR = '本机'
 
 /** localStorage 侧少量元数据键名 */
 export const LS_KEYS = {
@@ -44,6 +50,12 @@ export interface BackupPayload {
   cracks: Crack[]
   surveys: Survey[]
   advices: Advice[]
+  /** v3 起随备份导出的逻辑删除墓碑，旧版备份缺省为空 */
+  tombstones?: Tombstone[]
+  /** 导出班组/操作人，便于合并时辨认来源 */
+  exportedBy?: string
+  /** 备份内容指纹，合并去重用 */
+  hash?: string
 }
 
 /** 带行修订号的持久化实体，便于逐行迁移 */
@@ -52,13 +64,14 @@ export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type SectionRow = Section & Revisioned
 export type RingRow = Ring & Revisioned
 export type CrackRow = Crack & Revisioned
 export type SurveyRow = Survey & Revisioned
 export type AdviceRow = Advice & Revisioned
+export type TombstoneRow = Tombstone & Revisioned
 
 class TunnelCrackDatabase extends Dexie {
   sections!: Table<SectionRow, string>
@@ -66,6 +79,7 @@ class TunnelCrackDatabase extends Dexie {
   cracks!: Table<CrackRow, string>
   surveys!: Table<SurveyRow, string>
   advices!: Table<AdviceRow, string>
+  tombstones!: Table<TombstoneRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -80,7 +94,7 @@ class TunnelCrackDatabase extends Dexie {
     })
 
     // v2：裂缝补充 sectionId 冗余列（按区间筛选/统计免联表）；复测补充 surveyor 索引；建议补充 note 字段
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         sections: 'id, line, structureType, startMileage, updatedAt',
         rings: 'id, sectionId, ringNo, mileage, segmentType, updatedAt',
@@ -125,6 +139,61 @@ class TunnelCrackDatabase extends Dexie {
               survey.deltaWidthMm = 0
             }
           })
+      })
+
+    // v3：新增 tombstones 墓碑表（撤去的记录留痕，可随备份合并）；历史数据补齐 revision=3
+    this.version(DB_VERSION)
+      .stores({
+        sections: 'id, line, structureType, startMileage, updatedAt',
+        rings: 'id, sectionId, ringNo, mileage, segmentType, updatedAt',
+        cracks: 'id, ringId, sectionId, code, position, direction, state, updatedAt',
+        surveys: 'id, crackId, seq, date, surveyor, updatedAt',
+        advices: 'id, crackId, level, measure, state, updatedAt',
+        tombstones: 'id, table, entityId, sectionId, ringId, crackId, deletedAt'
+      })
+      .upgrade(async (tx) => {
+        const businessTables: Array<Table<Record<string, unknown>, string>> = [
+          tx.table('sections'),
+          tx.table('rings'),
+          tx.table('cracks'),
+          tx.table('surveys'),
+          tx.table('advices')
+        ]
+        for (const table of businessTables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION
+          })
+        }
+
+        // 历史测次序号可能与日期顺序不一致（离线合并补测后），统一按日期重排序次并重算变化量
+        const surveyRows = (await tx.table('surveys').toArray()) as SurveyRow[]
+        const byCrack = new Map<string, SurveyRow[]>()
+        surveyRows.forEach((survey) => {
+          const list = byCrack.get(survey.crackId)
+          if (list) list.push(survey)
+          else byCrack.set(survey.crackId, [survey])
+        })
+        const reordered: SurveyRow[] = []
+        byCrack.forEach((rows) => {
+          rows
+            .sort((a, b) =>
+              a.date === b.date
+                ? a.seq === b.seq
+                  ? (a.createdAt ?? 0) - (b.createdAt ?? 0)
+                  : a.seq - b.seq
+                : a.date.localeCompare(b.date)
+            )
+            .forEach((survey, index) => {
+              const previous = index === 0 ? null : rows[index - 1]
+              reordered.push({
+                ...survey,
+                seq: index + 1,
+                deltaWidthMm: previous ? round(survey.widthMm - previous.widthMm, 2) : 0,
+                revision: ROW_REVISION
+              })
+            })
+        })
+        if (reordered.length > 0) await tx.table('surveys').bulkPut(reordered)
       })
   }
 }
@@ -236,69 +305,341 @@ export async function initDatabase(): Promise<void> {
   }
 }
 
-/* ============================== 级联删除 ============================== */
+/* ====================== 逻辑删除（墓碑，可合并） ====================== */
 
-/** 删除区间：级联删除环片 → 裂缝 → 复测 → 建议 */
-export async function deleteSectionCascade(sectionId: string): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
+/** 读取当前班组/操作人名 */
+export function getActor(): string {
+  try {
+    return localStorage.getItem('gbtunnelcrack:crew-name')?.trim() || DEFAULT_ACTOR
+  } catch {
+    return DEFAULT_ACTOR
+  }
+}
+
+/** 写入一条删除墓碑（id 与原记录相同；已存在则覆盖以保留最新删除现场） */
+async function putTombstone(input: {
+  table: EntityTable
+  entityId: string
+  sectionId?: string
+  ringId?: string
+  crackId?: string
+  label: string
+  signature: string
+  origin?: Tombstone['origin']
+  deletedBy?: string
+  deletedAt?: number
+}): Promise<TombstoneRow> {
+  const now = input.deletedAt ?? Date.now()
+  const row: TombstoneRow = {
+    id: `tm_${input.table}_${input.entityId}`,
+    table: input.table,
+    entityId: input.entityId,
+    sectionId: input.sectionId,
+    ringId: input.ringId,
+    crackId: input.crackId,
+    label: input.label,
+    signature: input.signature,
+    deletedBy: input.deletedBy ?? getActor(),
+    deletedAt: now,
+    origin: input.origin ?? 'local',
+    revision: ROW_REVISION
+  }
+  await db.tombstones.put(row)
+  return row
+}
+
+/** 删除区间：级联逻辑删除环片 → 裂缝 → 复测 → 建议，全部留下墓碑 */
+export async function deleteSectionCascade(sectionId: string, actor?: string): Promise<void> {
+  await db.transaction('rw', [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.tombstones], async () => {
+    const section = await db.sections.get(sectionId)
     const rings = await db.rings.where('sectionId').equals(sectionId).toArray()
     const ringIds = rings.map((ring) => ring.id)
-    await deleteCracksOfRings(ringIds)
+    const cracks = ringIds.length > 0 ? await db.cracks.where('ringId').anyOf(ringIds).toArray() : []
+    const crackIds = cracks.map((crack) => crack.id)
+    const context = { rings, cracks }
+    const deletedBy = actor ?? getActor()
+
+    if (crackIds.length > 0) {
+      const surveys = await db.surveys.where('crackId').anyOf(crackIds).toArray()
+      const advices = await db.advices.where('crackId').anyOf(crackIds).toArray()
+      for (const survey of surveys) {
+        await putTombstone({
+          table: 'surveys',
+          entityId: survey.id,
+          sectionId,
+          ringId: cracks.find((crack) => crack.id === survey.crackId)?.ringId,
+          crackId: survey.crackId,
+          label: entityLabel('surveys', survey, context),
+          signature: signatureOf(survey),
+          deletedBy
+        })
+      }
+      for (const advice of advices) {
+        await putTombstone({
+          table: 'advices',
+          entityId: advice.id,
+          sectionId,
+          ringId: cracks.find((crack) => crack.id === advice.crackId)?.ringId,
+          crackId: advice.crackId,
+          label: entityLabel('advices', advice, context),
+          signature: signatureOf(advice),
+          deletedBy
+        })
+      }
+      await db.surveys.where('crackId').anyOf(crackIds).delete()
+      await db.advices.where('crackId').anyOf(crackIds).delete()
+      for (const crack of cracks) {
+        await putTombstone({
+          table: 'cracks',
+          entityId: crack.id,
+          sectionId,
+          ringId: crack.ringId,
+          label: entityLabel('cracks', crack, context),
+          signature: signatureOf(crack),
+          deletedBy
+        })
+      }
+      await db.cracks.bulkDelete(crackIds)
+    }
+
+    for (const ring of rings) {
+      await putTombstone({
+        table: 'rings',
+        entityId: ring.id,
+        sectionId,
+        label: entityLabel('rings', ring, context),
+        signature: signatureOf(ring),
+        deletedBy
+      })
+    }
     if (ringIds.length > 0) await db.rings.bulkDelete(ringIds)
-    await db.sections.delete(sectionId)
+
+    if (section) {
+      await putTombstone({
+        table: 'sections',
+        entityId: section.id,
+        label: entityLabel('sections', section),
+        signature: signatureOf(section),
+        deletedBy
+      })
+      await db.sections.delete(sectionId)
+    }
   })
 }
 
-/** 删除环片：级联删除裂缝及其下游 */
-export async function deleteRingCascade(ringId: string): Promise<void> {
-  await db.transaction('rw', db.rings, db.cracks, db.surveys, db.advices, async () => {
-    await deleteCracksOfRings([ringId])
-    await db.rings.delete(ringId)
+/** 删除环片：级联逻辑删除裂缝及其下游 */
+export async function deleteRingCascade(ringId: string, actor?: string): Promise<void> {
+  await db.transaction('rw', db.rings, db.cracks, db.surveys, db.advices, db.tombstones, async () => {
+    const ring = await db.rings.get(ringId)
+    const cracks = await db.cracks.where('ringId').equals(ringId).toArray()
+    const crackIds = cracks.map((crack) => crack.id)
+    const context = { rings: ring ? [ring] : [], cracks }
+    const deletedBy = actor ?? getActor()
+
+    if (crackIds.length > 0) {
+      const surveys = await db.surveys.where('crackId').anyOf(crackIds).toArray()
+      const advices = await db.advices.where('crackId').anyOf(crackIds).toArray()
+      for (const survey of surveys) {
+        await putTombstone({
+          table: 'surveys',
+          entityId: survey.id,
+          sectionId: ring?.sectionId,
+          ringId,
+          crackId: survey.crackId,
+          label: entityLabel('surveys', survey, context),
+          signature: signatureOf(survey),
+          deletedBy
+        })
+      }
+      for (const advice of advices) {
+        await putTombstone({
+          table: 'advices',
+          entityId: advice.id,
+          sectionId: ring?.sectionId,
+          ringId,
+          crackId: advice.crackId,
+          label: entityLabel('advices', advice, context),
+          signature: signatureOf(advice),
+          deletedBy
+        })
+      }
+      await db.surveys.where('crackId').anyOf(crackIds).delete()
+      await db.advices.where('crackId').anyOf(crackIds).delete()
+      for (const crack of cracks) {
+        await putTombstone({
+          table: 'cracks',
+          entityId: crack.id,
+          sectionId: ring?.sectionId,
+          ringId,
+          label: entityLabel('cracks', crack, context),
+          signature: signatureOf(crack),
+          deletedBy
+        })
+      }
+      await db.cracks.bulkDelete(crackIds)
+    }
+
+    if (ring) {
+      await putTombstone({
+        table: 'rings',
+        entityId: ring.id,
+        sectionId: ring.sectionId,
+        label: entityLabel('rings', ring, context),
+        signature: signatureOf(ring),
+        deletedBy
+      })
+      await db.rings.delete(ringId)
+    }
   })
 }
 
-/** 删除裂缝：级联删除复测与建议 */
-export async function deleteCrackCascade(crackId: string): Promise<void> {
-  await db.transaction('rw', db.cracks, db.surveys, db.advices, async () => {
+/** 删除裂缝：级联逻辑删除复测与建议 */
+export async function deleteCrackCascade(crackId: string, actor?: string): Promise<void> {
+  await db.transaction('rw', db.cracks, db.surveys, db.advices, db.tombstones, async () => {
+    const crack = await db.cracks.get(crackId)
+    const [surveys, advices] = await Promise.all([
+      db.surveys.where('crackId').equals(crackId).toArray(),
+      db.advices.where('crackId').equals(crackId).toArray()
+    ])
+    const context = { cracks: crack ? [crack] : [] }
+    const deletedBy = actor ?? getActor()
+    for (const survey of surveys) {
+      await putTombstone({
+        table: 'surveys',
+        entityId: survey.id,
+        sectionId: crack?.sectionId,
+        ringId: crack?.ringId,
+        crackId,
+        label: entityLabel('surveys', survey, context),
+        signature: signatureOf(survey),
+        deletedBy
+      })
+    }
+    for (const advice of advices) {
+      await putTombstone({
+        table: 'advices',
+        entityId: advice.id,
+        sectionId: crack?.sectionId,
+        ringId: crack?.ringId,
+        crackId,
+        label: entityLabel('advices', advice, context),
+        signature: signatureOf(advice),
+        deletedBy
+      })
+    }
     await db.surveys.where('crackId').equals(crackId).delete()
     await db.advices.where('crackId').equals(crackId).delete()
-    await db.cracks.delete(crackId)
+    if (crack) {
+      await putTombstone({
+        table: 'cracks',
+        entityId: crack.id,
+        sectionId: crack.sectionId,
+        ringId: crack.ringId,
+        label: entityLabel('cracks', crack, context),
+        signature: signatureOf(crack),
+        deletedBy
+      })
+      await db.cracks.delete(crackId)
+    }
   })
 }
 
-async function deleteCracksOfRings(ringIds: string[]): Promise<void> {
-  if (ringIds.length === 0) return
-  const cracks = await db.cracks.where('ringId').anyOf(ringIds).toArray()
-  const crackIds = cracks.map((crack) => crack.id)
-  if (crackIds.length > 0) {
-    await db.surveys.where('crackId').anyOf(crackIds).delete()
-    await db.advices.where('crackId').anyOf(crackIds).delete()
-    await db.cracks.bulkDelete(crackIds)
+/** 删除单条复测：留墓碑，并按日期重排该裂缝剩余测次 */
+export async function deleteSurveySoft(surveyId: string, actor?: string): Promise<void> {
+  await db.transaction('rw', db.cracks, db.surveys, db.tombstones, async () => {
+    const survey = await db.surveys.get(surveyId)
+    if (!survey) return
+    const crack = await db.cracks.get(survey.crackId)
+    await putTombstone({
+      table: 'surveys',
+      entityId: survey.id,
+      sectionId: crack?.sectionId,
+      ringId: crack?.ringId,
+      crackId: survey.crackId,
+      label: entityLabel('surveys', survey, { cracks: crack ? [crack] : [] }),
+      signature: signatureOf(survey),
+      deletedBy: actor ?? getActor()
+    })
+    await db.surveys.delete(surveyId)
+    await recalcSurveySeries(survey.crackId)
+  })
+}
+
+/** 删除单条建议：留墓碑 */
+export async function deleteAdviceSoft(adviceId: string, actor?: string): Promise<void> {
+  await db.transaction('rw', db.advices, db.tombstones, async () => {
+    const advice = await db.advices.get(adviceId)
+    if (!advice) return
+    const crack = await db.cracks.get(advice.crackId)
+    await putTombstone({
+      table: 'advices',
+      entityId: advice.id,
+      sectionId: crack?.sectionId,
+      ringId: crack?.ringId,
+      crackId: advice.crackId,
+      label: entityLabel('advices', advice, { cracks: crack ? [crack] : [] }),
+      signature: signatureOf(advice),
+      deletedBy: actor ?? getActor()
+    })
+    await db.advices.delete(adviceId)
+  })
+}
+
+/* ==================== 测次序次/变化量公共重算 ==================== */
+
+/**
+ * 测次补入或撤去后：按日期重排序次，重算每条变化量，
+ * 并把裂缝台账宽度/长度同步为最新测次读数（预警等级与建议依据由此自动跟着重算）。
+ */
+export async function recalcSurveySeries(crackId: string): Promise<void> {
+  const rows = (await db.surveys.where('crackId').equals(crackId).toArray()).sort((a, b) =>
+    a.date === b.date
+      ? a.seq === b.seq
+        ? (a.createdAt ?? 0) - (b.createdAt ?? 0)
+        : a.seq - b.seq
+      : a.date.localeCompare(b.date)
+  )
+  const now = Date.now()
+  const patches = rows.map((row, index) => {
+    const previous = index === 0 ? null : rows[index - 1]
+    return {
+      ...row,
+      seq: index + 1,
+      deltaWidthMm: previous ? round(row.widthMm - previous.widthMm, 2) : 0,
+      updatedAt: now
+    }
+  })
+  if (patches.length > 0) await db.surveys.bulkPut(patches)
+  const latest = patches[patches.length - 1]
+  if (latest) {
+    await db.cracks.update(crackId, { widthMm: latest.widthMm, lengthMm: latest.lengthMm, updatedAt: now })
   }
 }
 
 /* ============================ 整库导入导出 ============================ */
 
-/** 各表行数统计 */
+/** 各表行数统计（含墓碑） */
 export async function countAll(): Promise<Record<string, number>> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+  const [sections, rings, cracks, surveys, advices, tombstones] = await Promise.all([
     db.sections.count(),
     db.rings.count(),
     db.cracks.count(),
     db.surveys.count(),
-    db.advices.count()
+    db.advices.count(),
+    db.tombstones.count()
   ])
-  return { sections, rings, cracks, surveys, advices }
+  return { sections, rings, cracks, surveys, advices, tombstones }
 }
 
-/** 导出整库快照（剥离内部 revision 字段） */
-export async function exportSnapshot(): Promise<BackupPayload> {
-  const [sections, rings, cracks, surveys, advices] = await Promise.all([
+/** 导出整库快照（剥离内部 revision 字段；携带墓碑与导出人） */
+export async function exportSnapshot(exportedBy?: string): Promise<BackupPayload> {
+  const [sections, rings, cracks, surveys, advices, tombstones] = await Promise.all([
     db.sections.toArray(),
     db.rings.toArray(),
     db.cracks.toArray(),
     db.surveys.toArray(),
-    db.advices.toArray()
+    db.advices.toArray(),
+    db.tombstones.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -312,19 +653,22 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     rings: rings.map(strip),
     cracks: cracks.map(strip),
     surveys: surveys.map(strip),
-    advices: advices.map(strip)
+    advices: advices.map(strip),
+    tombstones: tombstones.map(strip),
+    exportedBy: (exportedBy ?? getActor()) || undefined
   }
 }
 
-/** 用快照覆盖整库 */
+/** 用快照覆盖导入（v1/v2 旧版备份无 tombstones 字段，按空读入；墓碑表一并复位） */
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
+  await db.transaction('rw', [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.tombstones], async () => {
     await Promise.all([
       db.sections.clear(),
       db.rings.clear(),
       db.cracks.clear(),
       db.surveys.clear(),
-      db.advices.clear()
+      db.advices.clear(),
+      db.tombstones.clear()
     ])
     const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
     await db.sections.bulkPut((payload.sections ?? []).map(rev))
@@ -332,18 +676,20 @@ export async function importSnapshot(payload: BackupPayload): Promise<void> {
     await db.cracks.bulkPut((payload.cracks ?? []).map(rev))
     await db.surveys.bulkPut((payload.surveys ?? []).map(rev))
     await db.advices.bulkPut((payload.advices ?? []).map(rev))
+    await db.tombstones.bulkPut((payload.tombstones ?? []).map(rev))
   })
 }
 
-/** 清空全部业务表 */
+/** 清空全部业务表（同时清掉墓碑） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', db.sections, db.rings, db.cracks, db.surveys, db.advices, async () => {
+  await db.transaction('rw', [db.sections, db.rings, db.cracks, db.surveys, db.advices, db.tombstones], async () => {
     await Promise.all([
       db.sections.clear(),
       db.rings.clear(),
       db.cracks.clear(),
       db.surveys.clear(),
-      db.advices.clear()
+      db.advices.clear(),
+      db.tombstones.clear()
     ])
   })
 }

@@ -1,4 +1,5 @@
 /** 整治建议：由裂缝发展速率分级带出，人工确认后下发 */
+import type { MergeOriginMark } from '@/types/mergeMark'
 export type AdviceLevel = '一般' | '较重' | '严重'
 export type AdviceMeasure = '观测' | '注浆' | '嵌缝' | '钢板带'
 export type AdviceState = '待下发' | '已下发' | '已完成'
@@ -13,6 +14,8 @@ export interface Advice {
   state: AdviceState
   createdAt: number
   updatedAt: number
+  /** 三向合并并入的建议标记 */
+  mergeOrigin?: MergeOriginMark
 }
 
 export const ADVICE_LEVELS: AdviceLevel[] = ['一般', '较重', '严重']

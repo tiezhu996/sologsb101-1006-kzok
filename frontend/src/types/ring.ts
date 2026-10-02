@@ -1,4 +1,5 @@
 /** 环片：区间内一环管片，裂缝的最小归属单元 */
+import type { MergeOriginMark } from '@/types/mergeMark'
 export type SegmentType = '钢筋混凝土' | '铸铁' | '钢管片'
 
 export interface Ring {
@@ -13,6 +14,8 @@ export interface Ring {
   installDate: string
   createdAt: number
   updatedAt: number
+  /** 三向合并双改并列时的来源标记 */
+  mergeOrigin?: MergeOriginMark
 }
 
 export const SEGMENT_TYPES: SegmentType[] = ['钢筋混凝土', '铸铁', '钢管片']

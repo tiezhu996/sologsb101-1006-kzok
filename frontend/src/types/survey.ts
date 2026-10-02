@@ -1,4 +1,5 @@
 /** 复测：对同一条裂缝按测次追加的读数记录 */
+import type { MergeOriginMark } from '@/types/mergeMark'
 export interface Survey {
   id: string
   crackId: string
@@ -14,6 +15,8 @@ export interface Survey {
   surveyor: string
   createdAt: number
   updatedAt: number
+  /** 三向合并双改并列时的来源标记 */
+  mergeOrigin?: MergeOriginMark
 }
 
 export interface SurveyDraft {

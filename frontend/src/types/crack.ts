@@ -1,4 +1,6 @@
 /** 裂缝：环片结构上的单条裂缝档案 */
+import type { MergeOriginMark } from '@/types/mergeMark'
+
 export type CrackPosition = '拱顶' | '侧墙' | '道床'
 export type CrackDirection = '纵向' | '环向' | '斜向'
 export type CrackState = '观察' | '待整治' | '已整治'
@@ -19,6 +21,8 @@ export interface Crack {
   state: CrackState
   createdAt: number
   updatedAt: number
+  /** 三向合并双改并列时的来源标记 */
+  mergeOrigin?: MergeOriginMark
 }
 
 export const CRACK_POSITIONS: CrackPosition[] = ['拱顶', '侧墙', '道床']

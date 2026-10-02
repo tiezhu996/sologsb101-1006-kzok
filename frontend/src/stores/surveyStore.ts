@@ -5,7 +5,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { db, type SurveyRow } from '@/utils/db'
+import { db, deleteSurveySoft, recalcSurveySeries, type SurveyRow } from '@/utils/db'
 import type { Survey, SurveyDraft } from '@/types/survey'
 import type { AdviceLevel } from '@/types/advice'
 import { buildSurveyPoints, levelFromRate, round } from '@/utils/rate'
@@ -98,13 +98,11 @@ export const useSurveyStore = defineStore('survey', () => {
   }
 
   /**
-   * 追加一次复测读数：自动取下一个测次序号并与前一次比对生成变化量
+   * 追加一次复测读数：落库后统一按日期重排序次并重算变化量，
+   * 避免离线补录的测次日期早于已有测次时序号错乱。
    */
   async function createSurvey(draft: SurveyDraft): Promise<SurveyRow> {
-    const existing = surveysOf(draft.crackId)
-    const previous = existing.length > 0 ? existing[existing.length - 1] : null
-    const seq = previous ? previous.seq + 1 : 1
-    const delta = previous ? round(draft.widthMm - previous.widthMm, 2) : 0
+    const seq = (await db.surveys.where('crackId').equals(draft.crackId).count()) + 1
     const row = (await surveyTable.create(
       {
         crackId: draft.crackId,
@@ -112,16 +110,16 @@ export const useSurveyStore = defineStore('survey', () => {
         date: draft.date,
         widthMm: round(draft.widthMm, 2),
         lengthMm: Math.round(draft.lengthMm),
-        deltaWidthMm: delta,
+        deltaWidthMm: 0,
         surveyor: draft.surveyor.trim() || '未署名'
       },
       'sv'
     )) as SurveyRow
-    await syncCrackToLatest(draft.crackId)
+    await recalcSurveySeries(draft.crackId)
     return row
   }
 
-  /** 编辑测次后重排序号并重算全部变化量 */
+  /** 编辑测次后按日期重排序次并重算全部变化量 */
   async function updateSurvey(id: string, draft: SurveyDraft): Promise<void> {
     const row = surveyTable.rows.value.find((item) => item.id === id)
     if (!row) return
@@ -131,41 +129,21 @@ export const useSurveyStore = defineStore('survey', () => {
       lengthMm: Math.round(draft.lengthMm),
       surveyor: draft.surveyor.trim() || '未署名'
     })
-    await recalculate(draft.crackId)
+    await recalcSurveySeries(draft.crackId)
   }
 
+  /** 撤去测次：留可合并的删除墓碑，剩余测次按日期重排并重算 */
   async function removeSurvey(id: string): Promise<void> {
     const row = surveyTable.rows.value.find((item) => item.id === id)
     if (!row) return
-    await surveyTable.remove(id)
-    await recalculate(row.crackId)
+    await deleteSurveySoft(id)
   }
 
-  /** 重排某条裂缝的测次序号，并按日期顺序重算变化量 */
+  /** 重排某条裂缝的测次序号，并按日期顺序重算变化量（保留旧调用名） */
   async function recalculate(crackId: string): Promise<void> {
-    const rows = (await db.surveys.where('crackId').equals(crackId).toArray()).sort((a, b) =>
-      a.date === b.date ? a.seq - b.seq : a.date.localeCompare(b.date)
-    )
-    const patches = rows.map((row, index) => {
-      const previous = index === 0 ? null : rows[index - 1]
-      return {
-        ...row,
-        seq: index + 1,
-        deltaWidthMm: previous ? round(row.widthMm - previous.widthMm, 2) : 0,
-        updatedAt: Date.now()
-      }
-    })
-    if (patches.length > 0) await db.surveys.bulkPut(patches)
-    await syncCrackToLatest(crackId)
+    await recalcSurveySeries(crackId)
   }
 
-  /** 把裂缝台账上的宽度/长度同步为最新测次读数 */
-  async function syncCrackToLatest(crackId: string): Promise<void> {
-    const rows = (await db.surveys.where('crackId').equals(crackId).toArray()).sort((a, b) => a.seq - b.seq)
-    const latest = rows[rows.length - 1]
-    if (!latest) return
-    await db.cracks.update(crackId, { widthMm: latest.widthMm, lengthMm: latest.lengthMm, updatedAt: Date.now() })
-  }
 
   return {
     surveyTable,
